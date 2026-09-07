@@ -3,13 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>線上日曆備忘錄（Supabase 版）</title>
+    <title>線上日曆備忘錄（語音與照片辨識版）</title>
+    <!-- 引入 Supabase SDK -->
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <!-- 引入 Tesseract.js 照片文字辨識庫 -->
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; display: flex; justify-content: center; padding: 30px 15px; }
         .container { width: 100%; max-width: 480px; background: #ffffff; padding: 24px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
-        h1 { text-align: center; color: #333; margin-bottom: 16px; font-size: 22px; }
+        h1 { text-align: center; color: #333; margin-bottom: 12px; font-size: 22px; }
         .calendar { background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 10px; padding: 14px; margin-bottom: 20px; }
         .calendar-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-weight: bold; color: #2c3e50; }
         .nav-btn { background: none; border: none; font-size: 16px; cursor: pointer; padding: 4px 8px; color: #4A90E2; font-weight: bold; border-radius: 4px; }
@@ -27,6 +30,14 @@
         .input-group { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
         textarea { width: 100%; height: 80px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; resize: vertical; font-size: 14px; outline: none; }
         textarea:focus { border-color: #4A90E2; }
+        
+        /* 工具按鈕群組（語音與照片） */
+        .tools-group { display: flex; gap: 8px; }
+        .tool-btn { flex: 1; background-color: #f0f4f8; border: 1px solid #cbd5e1; color: #334155; padding: 8px; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: bold; text-align: center; display: flex; align-items: center; justify-content: center; gap: 4px; }
+        .tool-btn:hover { background-color: #e2e8f0; }
+        .tool-btn.recording { background-color: #fee2e2; color: #dc2626; border-color: #fca5a5; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+
         button.add-btn { background-color: #4A90E2; color: white; border: none; padding: 10px; border-radius: 8px; font-size: 14px; cursor: pointer; font-weight: bold; }
         button.add-btn:hover { background-color: #357ABD; }
         .notes-list { list-style: none; display: flex; flex-direction: column; gap: 10px; }
@@ -35,59 +46,154 @@
         .delete-btn { background: #ff4d4f; color: white; border: none; padding: 3px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; flex-shrink: 0; }
         .delete-btn:hover { background: #d9363e; }
         .empty-msg { text-align: center; color: #aaa; font-size: 13px; padding: 10px 0; }
-        /* 除錯用的錯誤訊息框，之後確認沒問題可以拿掉 */
-        .debug-banner { display: none; background: #fff3cd; border: 1px solid #ffe08a; color: #664d03; padding: 10px 12px; border-radius: 8px; font-size: 12px; margin-bottom: 16px; white-space: pre-wrap; word-break: break-word; }
+        .status-badge { text-align: center; font-size: 12px; margin-bottom: 12px; color: #666; }
+        .status-badge.offline { color: #e67e22; }
+        .ocr-loading { text-align: center; font-size: 12px; color: #4A90E2; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>日曆備忘錄</h1>
-        <div id="debugBanner" class="debug-banner"></div>
+        <div id="statusBadge" class="status-badge">☁️ 資料庫同步中</div>
         <div class="calendar">
             <div class="calendar-header">
                 <button class="nav-btn" onclick="changeMonth(-1)">&lt;</button>
-                <span id="calendarTitle">載入中...</span>
+                <span id="calendarTitle"></span>
                 <button class="nav-btn" onclick="changeMonth(1)">&gt;</button>
             </div>
             <div class="calendar-grid" id="calendarGrid"></div>
         </div>
         <div class="selected-date-title" id="selectedDateDisplay"></div>
         <div class="input-group">
-            <textarea id="noteInput" placeholder="輸入記事內容..."></textarea>
+            <textarea id="noteInput" placeholder="輸入記事內容，或使用語音/照片辨識..."></textarea>
+            
+            <!-- 語音與照片辨識工具按鈕 -->
+            <div class="tools-group">
+                <button type="button" class="tool-btn" id="voiceBtn" onclick="toggleVoiceInput()">🎤 語音輸入</button>
+                <label class="tool-btn">
+                    📷 照片辨識
+                    <input type="file" id="imageInput" accept="image/*" capture="environment" onchange="processImage(event)" style="display:none;">
+                </label>
+            </div>
+            <div id="ocrStatus" class="ocr-loading"></div>
+
             <button class="add-btn" onclick="addNote()">新增記事</button>
         </div>
         <ul id="notesList" class="notes-list"></ul>
     </div>
 
     <script>
-        // ====== 除錯輔助：任何全域錯誤都會顯示在畫面上 ======
-        function showDebug(msg) {
-            const banner = document.getElementById('debugBanner');
-            if (!banner) return;
-            banner.style.display = 'block';
-            banner.textContent = '⚠️ 除錯訊息：' + msg;
-            console.error(msg);
-        }
-        window.addEventListener('error', (e) => showDebug(e.message));
-
         // ====== Supabase 設定 ======
         const SUPABASE_URL = 'https://broljqhljijzhwmexaep.supabase.co';
         const SUPABASE_ANON_KEY = 'sb_publishable_qqIgjS8JRD7FUSDHID86Tg_mjIjeWd9';
+        const LOCAL_STORAGE_KEY = 'calendar_notes_offline_data';
 
-        let sb;
-        try {
-            if (!window.supabase || typeof window.supabase.createClient !== 'function') {
-                throw new Error('Supabase SDK 沒有載入成功（window.supabase 不存在）。請檢查網路連線，或瀏覽器是否封鎖了 cdn.jsdelivr.net。');
-            }
-            sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-        } catch (err) {
-            showDebug(err.message);
-        }
+        const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
         const weekDays = ['日', '一', '二', '三', '四', '五', '六'];
         let viewDate = new Date();
         const todayStr = formatDateKey(new Date().getFullYear(), new Date().getMonth(), new Date().getDate());
         let selectedDateKey = todayStr;
+
+        // ====== 語音辨識邏輯 ======
+        let recognition = null;
+        let isListening = false;
+
+        function toggleVoiceInput() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) {
+                alert('您的瀏覽器不支援語音辨識功能，建議使用 Chrome 或 Safari');
+                return;
+            }
+
+            const voiceBtn = document.getElementById('voiceBtn');
+
+            if (isListening) {
+                if (recognition) recognition.stop();
+                return;
+            }
+
+            recognition = new SpeechRecognition();
+            recognition.lang = 'zh-TW';
+            recognition.continuous = false;
+            recognition.interimResults = false;
+
+            recognition.onstart = () => {
+                isListening = true;
+                voiceBtn.classList.add('recording');
+                voiceBtn.textContent = '🎙️ 聆聽中... (再點擊停止)';
+            };
+
+            recognition.onresult = (event) => {
+                const transcript = event.results[0][0].transcript;
+                const input = document.getElementById('noteInput');
+                input.value = input.value ? `${input.value}\n${transcript}` : transcript;
+            };
+
+            recognition.onerror = (event) => {
+                console.error('語音辨識出錯:', event.error);
+                alert('語音辨識失敗，請檢查麥克風權限');
+            };
+
+            recognition.onend = () => {
+                isListening = false;
+                voiceBtn.classList.remove('recording');
+                voiceBtn.textContent = '🎤 語音輸入';
+            };
+
+            recognition.start();
+        }
+
+        // ====== 照片文字辨識 (OCR) 邏輯 ======
+        async function processImage(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const statusEl = document.getElementById('ocrStatus');
+            statusEl.textContent = '⏳ 照片文字辨識中，請稍候...';
+
+            try {
+                // 初始化 Tesseract Worker（支援繁體中文與英文）
+                const worker = await Tesseract.createWorker('chi_tra+eng');
+                const ret = await worker.recognize(file);
+                await worker.terminate();
+
+                const text = ret.data.text.trim();
+                statusEl.textContent = '';
+
+                if (text) {
+                    const input = document.getElementById('noteInput');
+                    input.value = input.value ? `${input.value}\n${text}` : text;
+                } else {
+                    alert('未能在照片中辨識出清晰文字');
+                }
+            } catch (err) {
+                console.error('OCR 辨識失敗:', err);
+                statusEl.textContent = '';
+                alert('照片解析失敗，請確認網路連線正常');
+            } finally {
+                event.target.value = ''; // 清空 input 以便重複選擇同一張圖片
+            }
+        }
+
+        // ====== LocalStorage 輔助函式 ======
+        function getLocalData() {
+            try {
+                return JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY)) || {};
+            } catch (e) {
+                return {};
+            }
+        }
+
+        function saveLocalData(dateKey, notes) {
+            const data = getLocalData();
+            if (notes && notes.length > 0) {
+                data[dateKey] = notes;
+            } else {
+                delete data[dateKey];
+            }
+            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(data));
+        }
 
         function formatDateKey(year, month, day) {
             const m = String(month + 1).padStart(2, '0');
@@ -95,34 +201,60 @@
             return `${year}-${m}-${d}`;
         }
 
+        function updateStatusBadge(isOffline = false) {
+            const badge = document.getElementById('statusBadge');
+            if (!badge) return;
+            if (isOffline) {
+                badge.textContent = '⚡ 離線模式（資料儲存於本機）';
+                badge.classList.add('offline');
+            } else {
+                badge.textContent = '☁️ 雲端同步中';
+                badge.classList.remove('offline');
+            }
+        }
+
+        // 讀取指定日期的記事
         async function getNotesForDate(dateKey) {
-            if (!sb) return [];
             try {
-                const { data, error } = await sb
+                const { data, error } = await supabase
                     .from('calendar_notes')
                     .select('notes')
                     .eq('date_key', dateKey)
                     .maybeSingle();
-                if (error) {
-                    showDebug('讀取資料庫失敗: ' + error.message);
-                    return [];
-                }
-                return data ? data.notes : [];
+
+                if (error) throw error;
+
+                const notes = data ? data.notes : [];
+                saveLocalData(dateKey, notes);
+                updateStatusBadge(false);
+                return notes;
             } catch (err) {
-                showDebug('連線失敗: ' + err.message);
-                return [];
+                console.warn('Supabase 讀取失敗，切換至 LocalStorage:', err);
+                updateStatusBadge(true);
+                const localData = getLocalData();
+                return localData[dateKey] || [];
             }
         }
 
+        // 儲存記事
         async function saveNotesForDate(dateKey, notesArray) {
-            if (!sb) throw new Error('Supabase 尚未連線成功');
-            const { data, error } = await sb
-                .from('calendar_notes')
-                .upsert({ date_key: dateKey, notes: notesArray }, { onConflict: 'date_key' });
-            if (error) throw error;
-            return data;
+            saveLocalData(dateKey, notesArray);
+            try {
+                const { data, error } = await supabase
+                    .from('calendar_notes')
+                    .upsert({ date_key: dateKey, notes: notesArray }, { onConflict: 'date_key' });
+                
+                if (error) throw error;
+                updateStatusBadge(false);
+                return data;
+            } catch (err) {
+                console.warn('Supabase 儲存失敗，僅儲存於本地:', err);
+                updateStatusBadge(true);
+                return null;
+            }
         }
 
+        // 渲染月曆
         async function renderCalendar() {
             const grid = document.getElementById('calendarGrid');
             const title = document.getElementById('calendarTitle');
@@ -134,24 +266,37 @@
             title.textContent = `${year} 年 ${month + 1} 月`;
 
             let notesMap = {};
-            if (sb) {
-                try {
-                    const startKey = formatDateKey(year, month, 1);
-                    const endKey = formatDateKey(year, month, new Date(year, month + 1, 0).getDate());
-                    const { data: monthData, error } = await sb
-                        .from('calendar_notes')
-                        .select('date_key')
-                        .gte('date_key', startKey)
-                        .lte('date_key', endKey);
-
-                    if (error) {
-                        showDebug('無法取得當月標記: ' + error.message);
-                    } else if (monthData) {
-                        monthData.forEach(row => { notesMap[row.date_key] = true; });
-                    }
-                } catch (err) {
-                    showDebug('資料庫查詢異常: ' + err.message);
+            const localData = getLocalData();
+            Object.keys(localData).forEach(key => {
+                if (localData[key] && localData[key].length > 0) {
+                    notesMap[key] = true;
                 }
+            });
+
+            try {
+                const startKey = formatDateKey(year, month, 1);
+                const endKey = formatDateKey(year, month, new Date(year, month + 1, 0).getDate());
+                const { data: monthData, error } = await supabase
+                    .from('calendar_notes')
+                    .select('date_key, notes')
+                    .gte('date_key', startKey)
+                    .lte('date_key', endKey);
+
+                if (!error && monthData) {
+                    monthData.forEach(row => {
+                        if (row.notes && row.notes.length > 0) {
+                            notesMap[row.date_key] = true;
+                            saveLocalData(row.date_key, row.notes);
+                        } else {
+                            delete notesMap[row.date_key];
+                            saveLocalData(row.date_key, []);
+                        }
+                    });
+                    updateStatusBadge(false);
+                }
+            } catch (err) {
+                console.warn('雲端當月標記讀取失敗:', err);
+                updateStatusBadge(true);
             }
 
             weekDays.forEach(day => {
@@ -208,35 +353,30 @@
 
             dateDisplay.textContent = `📅 ${selectedDateKey} 的記事：`;
 
-            try {
-                const currentNotes = await getNotesForDate(selectedDateKey);
-                list.innerHTML = '';
+            const currentNotes = await getNotesForDate(selectedDateKey);
+            list.innerHTML = '';
 
-                if (currentNotes.length === 0) {
-                    list.innerHTML = '<p class="empty-msg">這一天沒有任何記事</p>';
-                    return;
-                }
-
-                currentNotes.forEach((note, index) => {
-                    const li = document.createElement('li');
-                    li.className = 'note-item';
-                    const content = document.createElement('span');
-                    content.className = 'note-content';
-                    content.textContent = note;
-                    const deleteBtn = document.createElement('button');
-                    deleteBtn.className = 'delete-btn';
-                    deleteBtn.textContent = '刪除';
-                    deleteBtn.onclick = async () => {
-                        await deleteNote(index);
-                    };
-                    li.appendChild(content);
-                    li.appendChild(deleteBtn);
-                    list.appendChild(li);
-                });
-            } catch (err) {
-                showDebug('讀取記事失敗: ' + err.message);
-                list.innerHTML = '<p class="empty-msg">讀取失敗，請檢查資料庫設定</p>';
+            if (currentNotes.length === 0) {
+                list.innerHTML = '<p class="empty-msg">這一天沒有任何記事</p>';
+                return;
             }
+
+            currentNotes.forEach((note, index) => {
+                const li = document.createElement('li');
+                li.className = 'note-item';
+                const content = document.createElement('span');
+                content.className = 'note-content';
+                content.textContent = note;
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'delete-btn';
+                deleteBtn.textContent = '刪除';
+                deleteBtn.onclick = async () => {
+                    await deleteNote(index);
+                };
+                li.appendChild(content);
+                li.appendChild(deleteBtn);
+                list.appendChild(li);
+            });
         }
 
         async function addNote() {
@@ -247,33 +387,23 @@
                 alert('請輸入記事內容！');
                 return;
             }
-            try {
-                const currentNotes = await getNotesForDate(selectedDateKey);
-                currentNotes.unshift(text);
-                await saveNotesForDate(selectedDateKey, currentNotes);
-                input.value = '';
-                renderCalendar();
-                renderNotes();
-            } catch (err) {
-                showDebug('新增失敗: ' + err.message);
-                alert('新增失敗，請確定已在 Supabase 建立 calendar_notes 資料表並設定 RLS 權限');
-            }
+            const currentNotes = await getNotesForDate(selectedDateKey);
+            currentNotes.unshift(text);
+            await saveNotesForDate(selectedDateKey, currentNotes);
+            input.value = '';
+            renderCalendar();
+            renderNotes();
         }
 
         async function deleteNote(index) {
-            try {
-                const currentNotes = await getNotesForDate(selectedDateKey);
-                currentNotes.splice(index, 1);
-                await saveNotesForDate(selectedDateKey, currentNotes);
-                renderCalendar();
-                renderNotes();
-            } catch (err) {
-                showDebug('刪除失敗: ' + err.message);
-                alert('刪除失敗，請稍後再試');
-            }
+            const currentNotes = await getNotesForDate(selectedDateKey);
+            currentNotes.splice(index, 1);
+            await saveNotesForDate(selectedDateKey, currentNotes);
+            renderCalendar();
+            renderNotes();
         }
 
-        // 初始化（一定會執行，就算 supabase 連線失敗，月曆本身也會顯示）
+        // 初始化
         renderCalendar();
         renderNotes();
     </script>
