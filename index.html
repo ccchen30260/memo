@@ -74,12 +74,12 @@
         const SUPABASE_URL = 'https://broljqhljijzhwmexaep.supabase.co';
         const SUPABASE_ANON_KEY = 'sb_publishable_qqIgjS8JRD7FUSDHID86Tg_mjIjeWd9';
 
-        let supabase;
+        let sb;
         try {
             if (!window.supabase || typeof window.supabase.createClient !== 'function') {
                 throw new Error('Supabase SDK 沒有載入成功（window.supabase 不存在）。請檢查網路連線，或瀏覽器是否封鎖了 cdn.jsdelivr.net。');
             }
-            supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+            sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
         } catch (err) {
             showDebug(err.message);
         }
@@ -96,9 +96,9 @@
         }
 
         async function getNotesForDate(dateKey) {
-            if (!supabase) return [];
+            if (!sb) return [];
             try {
-                const { data, error } = await supabase
+                const { data, error } = await sb
                     .from('calendar_notes')
                     .select('notes')
                     .eq('date_key', dateKey)
@@ -115,8 +115,8 @@
         }
 
         async function saveNotesForDate(dateKey, notesArray) {
-            if (!supabase) throw new Error('Supabase 尚未連線成功');
-            const { data, error } = await supabase
+            if (!sb) throw new Error('Supabase 尚未連線成功');
+            const { data, error } = await sb
                 .from('calendar_notes')
                 .upsert({ date_key: dateKey, notes: notesArray }, { onConflict: 'date_key' });
             if (error) throw error;
@@ -134,11 +134,11 @@
             title.textContent = `${year} 年 ${month + 1} 月`;
 
             let notesMap = {};
-            if (supabase) {
+            if (sb) {
                 try {
                     const startKey = formatDateKey(year, month, 1);
                     const endKey = formatDateKey(year, month, new Date(year, month + 1, 0).getDate());
-                    const { data: monthData, error } = await supabase
+                    const { data: monthData, error } = await sb
                         .from('calendar_notes')
                         .select('date_key')
                         .gte('date_key', startKey)
