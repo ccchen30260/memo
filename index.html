@@ -7,7 +7,6 @@
     <!-- 引入 Supabase SDK -->
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <style>
-        /* ===== 保留原本的 CSS，此處完整貼上 ===== */
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; display: flex; justify-content: center; padding: 30px 15px; }
         .container { width: 100%; max-width: 480px; background: #ffffff; padding: 24px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
@@ -78,13 +77,21 @@
 
         // 取得指定日期的記事
         async function getNotesForDate(dateKey) {
-            const { data, error } = await supabase
-                .from('calendar_notes')
-                .select('notes')
-                .eq('date_key', dateKey)
-                .maybeSingle();
-            if (error) throw error;
-            return data ? data.notes : [];
+            try {
+                const { data, error } = await supabase
+                    .from('calendar_notes')
+                    .select('notes')
+                    .eq('date_key', dateKey)
+                    .maybeSingle();
+                if (error) {
+                    console.warn('讀取資料庫失敗:', error.message);
+                    return [];
+                }
+                return data ? data.notes : [];
+            } catch (err) {
+                console.warn('連線失敗:', err);
+                return [];
+            }
         }
 
         // 儲存指定日期的記事（若無則新增，有則更新）
@@ -96,7 +103,7 @@
             return data;
         }
 
-        // 渲染月曆（需先載入當月所有有記事的日期）
+        // 渲染月曆
         async function renderCalendar() {
             const grid = document.getElementById('calendarGrid');
             const title = document.getElementById('calendarTitle');
@@ -107,19 +114,27 @@
             const month = viewDate.getMonth();
             title.textContent = `${year} 年 ${month + 1} 月`;
 
-            // 查詢當月所有 date_key
-            const startKey = formatDateKey(year, month, 1);
-            const endKey = formatDateKey(year, month, new Date(year, month + 1, 0).getDate());
-            const { data: monthData, error } = await supabase
-                .from('calendar_notes')
-                .select('date_key')
-                .gte('date_key', startKey)
-                .lte('date_key', endKey);
-            if (error) throw error;
+            // 1. 讀取當月記事標記 (透過 try...catch 避免 API 失敗阻斷月曆繪製)
+            let notesMap = {};
+            try {
+                const startKey = formatDateKey(year, month, 1);
+                const endKey = formatDateKey(year, month, new Date(year, month + 1, 0).getDate());
+                const { data: monthData, error } = await supabase
+                    .from('calendar_notes')
+                    .select('date_key')
+                    .gte('date_key', startKey)
+                    .lte('date_key', endKey);
 
-            const notesMap = {};
-            (monthData || []).forEach(row => { notesMap[row.date_key] = true; });
+                if (error) {
+                    console.warn('無法取得當月標記:', error.message);
+                } else if (monthData) {
+                    monthData.forEach(row => { notesMap[row.date_key] = true; });
+                }
+            } catch (err) {
+                console.warn('資料庫查詢異常:', err);
+            }
 
+            // 2. 繪製星期標題
             weekDays.forEach(day => {
                 const header = document.createElement('div');
                 header.className = 'day-header';
@@ -127,6 +142,7 @@
                 grid.appendChild(header);
             });
 
+            // 3. 繪製日期網格
             const firstDayIndex = new Date(year, month, 1).getDay();
             const totalDays = new Date(year, month + 1, 0).getDate();
             const today = new Date();
@@ -172,9 +188,10 @@
             const dateDisplay = document.getElementById('selectedDateDisplay');
             if (!list || !dateDisplay) return;
 
+            dateDisplay.textContent = `📅 ${selectedDateKey} 的記事：`;
+
             try {
                 const currentNotes = await getNotesForDate(selectedDateKey);
-                dateDisplay.textContent = `📅 ${selectedDateKey} 的記事：`;
                 list.innerHTML = '';
 
                 if (currentNotes.length === 0) {
@@ -200,7 +217,7 @@
                 });
             } catch (err) {
                 console.error('讀取記事失敗:', err);
-                list.innerHTML = '<p class="empty-msg">讀取失敗，請稍後再試</p>';
+                list.innerHTML = '<p class="empty-msg">讀取失敗，請檢查資料庫設定</p>';
             }
         }
 
@@ -221,7 +238,7 @@
                 renderNotes();
             } catch (err) {
                 console.error('新增失敗:', err);
-                alert('新增失敗，請檢查網路或權限設定');
+                alert('新增失敗，請確定已在 Supabase 建立 calendar_notes 資料表並設定 RLS 權限');
             }
         }
 
