@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>線上日曆備忘錄（Supabase 版）</title>
+    <title>線上日曆備忘錄（Supabase + 離線備份版）</title>
     <!-- 引入 Supabase SDK -->
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <style>
@@ -36,11 +36,14 @@
         .delete-btn { background: #ff4d4f; color: white; border: none; padding: 3px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; flex-shrink: 0; }
         .delete-btn:hover { background: #d9363e; }
         .empty-msg { text-align: center; color: #aaa; font-size: 13px; padding: 10px 0; }
+        .status-badge { text-align: center; font-size: 12px; margin-bottom: 12px; color: #666; }
+        .status-badge.offline { color: #e67e22; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>日曆備忘錄</h1>
+        <div id="statusBadge" class="status-badge">☁️ 資料庫同步中</div>
         <div class="calendar">
             <div class="calendar-header">
                 <button class="nav-btn" onclick="changeMonth(-1)">&lt;</button>
@@ -58,9 +61,10 @@
     </div>
 
     <script>
-        // ====== 請替換成你的 Supabase 設定 ======
+        // ====== Supabase 設定 ======
         const SUPABASE_URL = 'https://broljqhljijzhwmexaep.supabase.co';
         const SUPABASE_ANON_KEY = 'sb_publishable_qqIgjS8JRD7FUSDHID86Tg_mjIjeWd9';
+        const LOCAL_STORAGE_KEY = 'calendar_notes_offline_data';
 
         const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
@@ -69,13 +73,44 @@
         const todayStr = formatDateKey(new Date().getFullYear(), new Date().getMonth(), new Date().getDate());
         let selectedDateKey = todayStr;
 
+        // ====== LocalStorage 輔助函式 ======
+        function getLocalData() {
+            try {
+                return JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY)) || {};
+            } catch (e) {
+                return {};
+            }
+        }
+
+        function saveLocalData(dateKey, notes) {
+            const data = getLocalData();
+            if (notes && notes.length > 0) {
+                data[dateKey] = notes;
+            } else {
+                delete data[dateKey];
+            }
+            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(data));
+        }
+
         function formatDateKey(year, month, day) {
             const m = String(month + 1).padStart(2, '0');
             const d = String(day).padStart(2, '0');
             return `${year}-${m}-${d}`;
         }
 
-        // 取得指定日期的記事
+        function updateStatusBadge(isOffline = false) {
+            const badge = document.getElementById('statusBadge');
+            if (!badge) return;
+            if (isOffline) {
+                badge.textContent = '⚡ 離線模式（資料儲存於本機）';
+                badge.classList.add('offline');
+            } else {
+                badge.textContent = '☁️ 雲端同步中';
+                badge.classList.remove('offline');
+            }
+        }
+
+        // 讀取指定日期的記事（優先嘗試 Supabase，失敗改用 LocalStorage）
         async function getNotesForDate(dateKey) {
             try {
                 const { data, error } = await supabase
@@ -83,24 +118,40 @@
                     .select('notes')
                     .eq('date_key', dateKey)
                     .maybeSingle();
-                if (error) {
-                    console.warn('讀取資料庫失敗:', error.message);
-                    return [];
-                }
-                return data ? data.notes : [];
+
+                if (error) throw error;
+
+                const notes = data ? data.notes : [];
+                saveLocalData(dateKey, notes); // 同步更新本機快取
+                updateStatusBadge(false);
+                return notes;
             } catch (err) {
-                console.warn('連線失敗:', err);
-                return [];
+                console.warn('Supabase 讀取失敗，切換至 LocalStorage:', err);
+                updateStatusBadge(true);
+                const localData = getLocalData();
+                return localData[dateKey] || [];
             }
         }
 
-        // 儲存指定日期的記事（若無則新增，有則更新）
+        // 儲存記事（本地與雲端同步寫入）
         async function saveNotesForDate(dateKey, notesArray) {
-            const { data, error } = await supabase
-                .from('calendar_notes')
-                .upsert({ date_key: dateKey, notes: notesArray }, { onConflict: 'date_key' });
-            if (error) throw error;
-            return data;
+            // 1. 先即時寫入本機 LocalStorage，確保反應迅速
+            saveLocalData(dateKey, notesArray);
+
+            // 2. 嘗試寫入 Supabase 雲端
+            try {
+                const { data, error } = await supabase
+                    .from('calendar_notes')
+                    .upsert({ date_key: dateKey, notes: notesArray }, { onConflict: 'date_key' });
+                
+                if (error) throw error;
+                updateStatusBadge(false);
+                return data;
+            } catch (err) {
+                console.warn('Supabase 儲存失敗，已僅儲存於本地 LocalStorage:', err);
+                updateStatusBadge(true);
+                return null;
+            }
         }
 
         // 渲染月曆
@@ -114,27 +165,43 @@
             const month = viewDate.getMonth();
             title.textContent = `${year} 年 ${month + 1} 月`;
 
-            // 1. 讀取當月記事標記 (透過 try...catch 避免 API 失敗阻斷月曆繪製)
+            // 1. 載入本地儲存的點位標記作為預設值
             let notesMap = {};
+            const localData = getLocalData();
+            Object.keys(localData).forEach(key => {
+                if (localData[key] && localData[key].length > 0) {
+                    notesMap[key] = true;
+                }
+            });
+
+            // 2. 嘗試從 Supabase 取得最新點位資訊
             try {
                 const startKey = formatDateKey(year, month, 1);
                 const endKey = formatDateKey(year, month, new Date(year, month + 1, 0).getDate());
                 const { data: monthData, error } = await supabase
                     .from('calendar_notes')
-                    .select('date_key')
+                    .select('date_key, notes')
                     .gte('date_key', startKey)
                     .lte('date_key', endKey);
 
-                if (error) {
-                    console.warn('無法取得當月標記:', error.message);
-                } else if (monthData) {
-                    monthData.forEach(row => { notesMap[row.date_key] = true; });
+                if (!error && monthData) {
+                    monthData.forEach(row => {
+                        if (row.notes && row.notes.length > 0) {
+                            notesMap[row.date_key] = true;
+                            saveLocalData(row.date_key, row.notes);
+                        } else {
+                            delete notesMap[row.date_key];
+                            saveLocalData(row.date_key, []);
+                        }
+                    });
+                    updateStatusBadge(false);
                 }
             } catch (err) {
-                console.warn('資料庫查詢異常:', err);
+                console.warn('雲端當月標記讀取失敗，顯示本地標記:', err);
+                updateStatusBadge(true);
             }
 
-            // 2. 繪製星期標題
+            // 3. 繪製星期標題
             weekDays.forEach(day => {
                 const header = document.createElement('div');
                 header.className = 'day-header';
@@ -142,7 +209,7 @@
                 grid.appendChild(header);
             });
 
-            // 3. 繪製日期網格
+            // 4. 繪製日期網格
             const firstDayIndex = new Date(year, month, 1).getDay();
             const totalDays = new Date(year, month + 1, 0).getDate();
             const today = new Date();
@@ -190,35 +257,30 @@
 
             dateDisplay.textContent = `📅 ${selectedDateKey} 的記事：`;
 
-            try {
-                const currentNotes = await getNotesForDate(selectedDateKey);
-                list.innerHTML = '';
+            const currentNotes = await getNotesForDate(selectedDateKey);
+            list.innerHTML = '';
 
-                if (currentNotes.length === 0) {
-                    list.innerHTML = '<p class="empty-msg">這一天沒有任何記事</p>';
-                    return;
-                }
-
-                currentNotes.forEach((note, index) => {
-                    const li = document.createElement('li');
-                    li.className = 'note-item';
-                    const content = document.createElement('span');
-                    content.className = 'note-content';
-                    content.textContent = note;
-                    const deleteBtn = document.createElement('button');
-                    deleteBtn.className = 'delete-btn';
-                    deleteBtn.textContent = '刪除';
-                    deleteBtn.onclick = async () => {
-                        await deleteNote(index);
-                    };
-                    li.appendChild(content);
-                    li.appendChild(deleteBtn);
-                    list.appendChild(li);
-                });
-            } catch (err) {
-                console.error('讀取記事失敗:', err);
-                list.innerHTML = '<p class="empty-msg">讀取失敗，請檢查資料庫設定</p>';
+            if (currentNotes.length === 0) {
+                list.innerHTML = '<p class="empty-msg">這一天沒有任何記事</p>';
+                return;
             }
+
+            currentNotes.forEach((note, index) => {
+                const li = document.createElement('li');
+                li.className = 'note-item';
+                const content = document.createElement('span');
+                content.className = 'note-content';
+                content.textContent = note;
+                const deleteBtn = document.createElement('button');
+                deleteBtn.className = 'delete-btn';
+                deleteBtn.textContent = '刪除';
+                deleteBtn.onclick = async () => {
+                    await deleteNote(index);
+                };
+                li.appendChild(content);
+                li.appendChild(deleteBtn);
+                list.appendChild(li);
+            });
         }
 
         async function addNote() {
@@ -229,30 +291,20 @@
                 alert('請輸入記事內容！');
                 return;
             }
-            try {
-                const currentNotes = await getNotesForDate(selectedDateKey);
-                currentNotes.unshift(text);
-                await saveNotesForDate(selectedDateKey, currentNotes);
-                input.value = '';
-                renderCalendar();
-                renderNotes();
-            } catch (err) {
-                console.error('新增失敗:', err);
-                alert('新增失敗，請確定已在 Supabase 建立 calendar_notes 資料表並設定 RLS 權限');
-            }
+            const currentNotes = await getNotesForDate(selectedDateKey);
+            currentNotes.unshift(text);
+            await saveNotesForDate(selectedDateKey, currentNotes);
+            input.value = '';
+            renderCalendar();
+            renderNotes();
         }
 
         async function deleteNote(index) {
-            try {
-                const currentNotes = await getNotesForDate(selectedDateKey);
-                currentNotes.splice(index, 1);
-                await saveNotesForDate(selectedDateKey, currentNotes);
-                renderCalendar();
-                renderNotes();
-            } catch (err) {
-                console.error('刪除失敗:', err);
-                alert('刪除失敗，請稍後再試');
-            }
+            const currentNotes = await getNotesForDate(selectedDateKey);
+            currentNotes.splice(index, 1);
+            await saveNotesForDate(selectedDateKey, currentNotes);
+            renderCalendar();
+            renderNotes();
         }
 
         // 初始化
