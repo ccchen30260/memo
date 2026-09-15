@@ -6,6 +6,8 @@
     <title>線上日曆備忘錄（Supabase 版）</title>
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/fuse.js@7/dist/fuse.min.js"></script>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #f4f6f9; display: flex; justify-content: center; padding: 30px 15px; }
@@ -46,12 +48,51 @@
         .tool-btn.recording { background: #ff4d4f; color: #fff; border-color: #ff4d4f; animation: pulse 1.2s infinite; }
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
         .tool-status { font-size: 12px; color: #888; min-height: 16px; }
+        /* 模糊搜尋 */
+        .search-wrap { position: relative; margin-bottom: 20px; }
+        .search-input { width: 100%; padding: 10px 34px 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; outline: none; }
+        .search-input:focus { border-color: #4A90E2; }
+        .search-clear { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); border: none; background: none; color: #aaa; font-size: 16px; cursor: pointer; display: none; padding: 4px; }
+        .search-results { position: absolute; top: 100%; left: 0; right: 0; margin-top: 4px; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; box-shadow: 0 6px 16px rgba(0,0,0,0.12); max-height: 280px; overflow-y: auto; z-index: 20; display: none; }
+        .search-result-item { padding: 10px 12px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
+        .search-result-item:last-child { border-bottom: none; }
+        .search-result-item:hover { background: #f4f6f9; }
+        .search-result-date { font-size: 11px; font-weight: bold; color: #4A90E2; margin-bottom: 3px; }
+        .search-result-text { font-size: 13px; color: #444; line-height: 1.4; white-space: pre-wrap; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+        .search-result-text mark { background: #fff2b2; color: inherit; border-radius: 2px; }
+        .search-empty { padding: 12px; text-align: center; color: #aaa; font-size: 13px; }
+        .note-item.highlight { outline: 2px solid #f39c12; outline-offset: 1px; }
+        /* Google 日曆連動 */
+        .gcal-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; padding: 10px 12px; background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 8px; }
+        .gcal-btn { background: #fff; border: 1px solid #dadce0; color: #3c4043; padding: 7px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: bold; white-space: nowrap; }
+        .gcal-btn:hover { background: #f1f3f4; }
+        .gcal-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .gcal-state { font-size: 12px; color: #888; flex: 1; word-break: break-all; }
+        .gcal-state.connected { color: #1e8e3e; font-weight: bold; }
+        .sync-check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #555; cursor: pointer; }
+        .sync-check input { width: 15px; height: 15px; cursor: pointer; }
+        .day-cell.has-gcal::before { content: ''; width: 4px; height: 4px; background-color: #1a73e8; border-radius: 50%; position: absolute; bottom: 3px; }
+        .day-cell.has-note.has-gcal::after { transform: translateX(4px); }
+        .day-cell.has-note.has-gcal::before { transform: translateX(-4px); }
+        .day-cell.selected.has-gcal::before { background-color: #cfe2ff; }
+        .note-item.gcal-item { border-left-color: #1a73e8; background: #f6f9fe; }
+        .gcal-badge { display: inline-block; font-size: 10px; font-weight: bold; color: #1a73e8; border: 1px solid #c3d9f7; background: #fff; border-radius: 3px; padding: 1px 5px; margin-bottom: 4px; }
+        .gcal-time { font-size: 11px; color: #777; margin-top: 3px; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>日曆備忘錄</h1>
         <div id="debugBanner" class="debug-banner"></div>
+        <div class="gcal-bar">
+            <span class="gcal-state" id="gcalState">尚未連結 Google 日曆</span>
+            <button type="button" class="gcal-btn" id="gcalBtn" onclick="toggleGoogleAuth()">連結 Google 日曆</button>
+        </div>
+        <div class="search-wrap">
+            <input type="text" id="searchInput" class="search-input" placeholder="🔍 模糊搜尋所有記事..." oninput="onSearchInput()" onfocus="onSearchInput()">
+            <button type="button" class="search-clear" id="searchClearBtn" onclick="clearSearch()">✕</button>
+            <div id="searchResults" class="search-results"></div>
+        </div>
         <div class="calendar">
             <div class="calendar-header">
                 <button class="nav-btn" onclick="changeMonth(-1)">&lt;</button>
@@ -69,6 +110,10 @@
             </div>
             <input type="file" id="photoInput" accept="image/*" capture="environment" style="display:none" onchange="handlePhotoSelected(event)">
             <div class="tool-status" id="toolStatus"></div>
+            <label class="sync-check">
+                <input type="checkbox" id="syncToGoogle">
+                <span>同時加入 Google 日曆（當天全天事件）</span>
+            </label>
             <button class="add-btn" onclick="addNote()">新增記事</button>
         </div>
         <ul id="notesList" class="notes-list"></ul>
@@ -169,6 +214,9 @@
                 }
             }
 
+            // 讀取當月 Google 日曆事件
+            googleEventsCache = await fetchGoogleEventsForMonth(year, month);
+
             weekDays.forEach(day => {
                 const header = document.createElement('div');
                 header.className = 'day-header';
@@ -201,6 +249,9 @@
                 if (notesMap[dateKey]) {
                     cell.classList.add('has-note');
                 }
+                if (googleEventsCache[dateKey] && googleEventsCache[dateKey].length > 0) {
+                    cell.classList.add('has-gcal');
+                }
 
                 cell.onclick = () => {
                     selectedDateKey = dateKey;
@@ -227,14 +278,54 @@
                 const currentNotes = await getNotesForDate(selectedDateKey);
                 list.innerHTML = '';
 
+                // 先列出當天的 Google 日曆事件（唯讀）
+                const gEvents = googleEventsCache[selectedDateKey] || [];
+                gEvents.forEach(ev => {
+                    const li = document.createElement('li');
+                    li.className = 'note-item gcal-item';
+
+                    const wrap = document.createElement('div');
+                    wrap.style.flex = '1';
+
+                    const badge = document.createElement('div');
+                    badge.className = 'gcal-badge';
+                    badge.textContent = 'Google 日曆';
+
+                    const content = document.createElement('div');
+                    content.className = 'note-content';
+                    content.textContent = ev.title;
+
+                    const timeEl = document.createElement('div');
+                    timeEl.className = 'gcal-time';
+                    timeEl.textContent = formatGoogleEventTime(ev);
+
+                    wrap.appendChild(badge);
+                    wrap.appendChild(content);
+                    wrap.appendChild(timeEl);
+                    li.appendChild(wrap);
+
+                    if (ev.htmlLink) {
+                        const openBtn = document.createElement('button');
+                        openBtn.className = 'delete-btn';
+                        openBtn.style.background = '#1a73e8';
+                        openBtn.textContent = '開啟';
+                        openBtn.onclick = () => window.open(ev.htmlLink, '_blank');
+                        li.appendChild(openBtn);
+                    }
+                    list.appendChild(li);
+                });
+
                 if (currentNotes.length === 0) {
-                    list.innerHTML = '<p class="empty-msg">這一天沒有任何記事</p>';
+                    if (gEvents.length === 0) {
+                        list.innerHTML = '<p class="empty-msg">這一天沒有任何記事</p>';
+                    }
                     return;
                 }
 
                 currentNotes.forEach((note, index) => {
                     const li = document.createElement('li');
                     li.className = 'note-item';
+                    li.dataset.noteIndex = String(index);
                     const content = document.createElement('span');
                     content.className = 'note-content';
                     content.textContent = note;
@@ -262,13 +353,34 @@
                 alert('請輸入記事內容！');
                 return;
             }
+            const syncBox = document.getElementById('syncToGoogle');
+            const wantSync = syncBox && syncBox.checked;
+
+            if (wantSync && !googleAccessToken) {
+                alert('請先點上方的「連結 Google 日曆」完成授權。');
+                return;
+            }
+
             try {
                 const currentNotes = await getNotesForDate(selectedDateKey);
                 currentNotes.unshift(text);
                 await saveNotesForDate(selectedDateKey, currentNotes);
                 input.value = '';
-                renderCalendar();
-                renderNotes();
+
+                // 選擇性寫入 Google 日曆（失敗不影響記事已存檔）
+                if (wantSync) {
+                    setToolStatus('正在寫入 Google 日曆...');
+                    try {
+                        await createGoogleEvent(selectedDateKey, text);
+                        setToolStatus('已同步到 Google 日曆 ✓');
+                    } catch (gErr) {
+                        showDebug(gErr.message);
+                        setToolStatus('記事已儲存，但同步 Google 日曆失敗');
+                    }
+                }
+
+                await renderCalendar();
+                await renderNotes();
             } catch (err) {
                 showDebug('新增失敗: ' + err.message);
                 alert('新增失敗，請確定已在 Supabase 建立 calendar_notes 資料表並設定 RLS 權限');
@@ -399,6 +511,331 @@
                 photoBtn.disabled = false;
             }
         }
+
+        // ====== Google 日曆連動 ======
+        // ⚠️ 請到 Google Cloud Console 建立 OAuth 用戶端 ID，並填在這裡
+        const GOOGLE_CLIENT_ID = '952054817768-q4tnhfp0nm0jc0p02jkc2mnt0s6qlohc.apps.googleusercontent.com';
+        const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+
+        let googleTokenClient = null;
+        let googleAccessToken = null;
+        let googleEventsCache = {};   // { 'YYYY-MM-DD': [event, ...] }
+
+        function setGcalState(msg, connected) {
+            const el = document.getElementById('gcalState');
+            const btn = document.getElementById('gcalBtn');
+            if (el) {
+                el.textContent = msg;
+                el.classList.toggle('connected', !!connected);
+            }
+            if (btn) btn.textContent = connected ? '中斷連結' : '連結 Google 日曆';
+        }
+
+        function initGoogleTokenClient() {
+            if (googleTokenClient) return true;
+            if (typeof google === 'undefined' || !google.accounts || !google.accounts.oauth2) {
+                return false;
+            }
+            googleTokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: GOOGLE_CLIENT_ID,
+                scope: GOOGLE_SCOPE,
+                callback: async (resp) => {
+                    if (resp.error) {
+                        showDebug('Google 授權失敗: ' + resp.error);
+                        setGcalState('授權失敗：' + resp.error, false);
+                        return;
+                    }
+                    googleAccessToken = resp.access_token;
+                    setGcalState('已連結 Google 日曆 ✓', true);
+                    googleEventsCache = {};
+                    await renderCalendar();
+                    await renderNotes();
+                }
+            });
+            return true;
+        }
+
+        function toggleGoogleAuth() {
+            if (googleAccessToken) {
+                // 中斷連結
+                try {
+                    google.accounts.oauth2.revoke(googleAccessToken, () => {});
+                } catch (e) { /* 忽略 */ }
+                googleAccessToken = null;
+                googleEventsCache = {};
+                setGcalState('尚未連結 Google 日曆', false);
+                renderCalendar();
+                renderNotes();
+                return;
+            }
+
+            if (GOOGLE_CLIENT_ID.indexOf('請填入') === 0) {
+                alert('尚未設定 Google Client ID。\n請先到 Google Cloud Console 建立 OAuth 用戶端 ID，再填入程式碼中的 GOOGLE_CLIENT_ID。');
+                return;
+            }
+            if (!initGoogleTokenClient()) {
+                alert('Google 登入元件尚未載入完成，請稍後再試一次。');
+                return;
+            }
+            googleTokenClient.requestAccessToken();
+        }
+
+        // 授權過期時重新請求
+        function handleGoogleAuthExpired() {
+            googleAccessToken = null;
+            setGcalState('授權已過期，請重新連結', false);
+        }
+
+        // 讀取某個月份的 Google 日曆事件
+        async function fetchGoogleEventsForMonth(year, month) {
+            if (!googleAccessToken) return {};
+
+            const timeMin = new Date(year, month, 1, 0, 0, 0).toISOString();
+            const timeMax = new Date(year, month + 1, 0, 23, 59, 59).toISOString();
+            const url = 'https://www.googleapis.com/calendar/v3/calendars/primary/events'
+                + '?timeMin=' + encodeURIComponent(timeMin)
+                + '&timeMax=' + encodeURIComponent(timeMax)
+                + '&singleEvents=true&orderBy=startTime&maxResults=250';
+
+            try {
+                const res = await fetch(url, {
+                    headers: { 'Authorization': 'Bearer ' + googleAccessToken }
+                });
+                if (res.status === 401) {
+                    handleGoogleAuthExpired();
+                    return {};
+                }
+                if (!res.ok) {
+                    showDebug('讀取 Google 日曆失敗 (HTTP ' + res.status + ')');
+                    return {};
+                }
+                const json = await res.json();
+                const map = {};
+                (json.items || []).forEach(ev => {
+                    // 全天事件用 date，一般事件用 dateTime
+                    const startRaw = (ev.start && (ev.start.date || ev.start.dateTime)) || null;
+                    if (!startRaw) return;
+                    const dateKey = startRaw.substring(0, 10);
+                    if (!map[dateKey]) map[dateKey] = [];
+                    map[dateKey].push({
+                        id: ev.id,
+                        title: ev.summary || '(無標題)',
+                        isAllDay: !!(ev.start && ev.start.date),
+                        startRaw: startRaw,
+                        htmlLink: ev.htmlLink || ''
+                    });
+                });
+                return map;
+            } catch (err) {
+                showDebug('Google 日曆連線錯誤: ' + err.message);
+                return {};
+            }
+        }
+
+        // 把一則記事寫入 Google 日曆（當天全天事件）
+        async function createGoogleEvent(dateKey, text) {
+            if (!googleAccessToken) throw new Error('尚未連結 Google 日曆');
+
+            // 全天事件的 end.date 要是隔天
+            const [y, m, d] = dateKey.split('-').map(Number);
+            const endDate = new Date(y, m - 1, d + 1);
+            const endKey = formatDateKey(endDate.getFullYear(), endDate.getMonth(), endDate.getDate());
+
+            const body = {
+                summary: text.split('\n')[0].slice(0, 200),
+                description: text,
+                start: { date: dateKey },
+                end: { date: endKey }
+            };
+
+            const res = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+                method: 'POST',
+                headers: {
+                    'Authorization': 'Bearer ' + googleAccessToken,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(body)
+            });
+
+            if (res.status === 401) {
+                handleGoogleAuthExpired();
+                throw new Error('Google 授權已過期，請重新連結');
+            }
+            if (!res.ok) {
+                const errText = await res.text();
+                throw new Error('寫入 Google 日曆失敗: ' + errText.slice(0, 120));
+            }
+            return await res.json();
+        }
+
+        function formatGoogleEventTime(ev) {
+            if (ev.isAllDay) return '全天';
+            try {
+                const dt = new Date(ev.startRaw);
+                return String(dt.getHours()).padStart(2, '0') + ':' + String(dt.getMinutes()).padStart(2, '0');
+            } catch (e) {
+                return '';
+            }
+        }
+
+        // ====== 模糊搜尋所有記事 ======
+        let searchDebounceTimer = null;
+        let pendingHighlightNoteIndex = null;
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        function onSearchInput() {
+            const input = document.getElementById('searchInput');
+            const clearBtn = document.getElementById('searchClearBtn');
+            const query = input.value.trim();
+            clearBtn.style.display = query ? 'block' : 'none';
+
+            if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+
+            if (!query) {
+                hideSearchResults();
+                return;
+            }
+            searchDebounceTimer = setTimeout(() => performSearch(query), 300);
+        }
+
+        function clearSearch() {
+            const input = document.getElementById('searchInput');
+            input.value = '';
+            document.getElementById('searchClearBtn').style.display = 'none';
+            hideSearchResults();
+        }
+
+        function hideSearchResults() {
+            const box = document.getElementById('searchResults');
+            box.style.display = 'none';
+            box.innerHTML = '';
+        }
+
+        async function performSearch(query) {
+            const box = document.getElementById('searchResults');
+
+            if (!sb) {
+                box.innerHTML = '<div class="search-empty">尚未連線到資料庫，無法搜尋</div>';
+                box.style.display = 'block';
+                return;
+            }
+            if (typeof Fuse === 'undefined') {
+                box.innerHTML = '<div class="search-empty">搜尋模組尚未載入完成，請稍後再試</div>';
+                box.style.display = 'block';
+                return;
+            }
+
+            box.innerHTML = '<div class="search-empty">搜尋中...</div>';
+            box.style.display = 'block';
+
+            try {
+                const { data, error } = await sb
+                    .from('calendar_notes')
+                    .select('date_key, notes');
+
+                if (error) {
+                    showDebug('搜尋失敗: ' + error.message);
+                    box.innerHTML = '<div class="search-empty">搜尋失敗，請稍後再試</div>';
+                    return;
+                }
+
+                const flatItems = [];
+                (data || []).forEach(row => {
+                    (row.notes || []).forEach((noteText, idx) => {
+                        flatItems.push({ dateKey: row.date_key, noteIndex: idx, text: noteText });
+                    });
+                });
+
+                if (flatItems.length === 0) {
+                    box.innerHTML = '<div class="search-empty">目前還沒有任何記事可以搜尋</div>';
+                    return;
+                }
+
+                const fuse = new Fuse(flatItems, {
+                    keys: ['text'],
+                    threshold: 0.4,
+                    ignoreLocation: true,
+                    minMatchCharLength: 1
+                });
+                const results = fuse.search(query).slice(0, 20);
+                renderSearchResults(results, query);
+            } catch (err) {
+                showDebug('搜尋發生錯誤: ' + err.message);
+                box.innerHTML = '<div class="search-empty">搜尋發生錯誤</div>';
+            }
+        }
+
+        function highlightQueryInText(text, query) {
+            const safeText = escapeHtml(text);
+            const safeQuery = escapeHtml(query).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            if (!safeQuery) return safeText;
+            try {
+                return safeText.replace(new RegExp('(' + safeQuery + ')', 'ig'), '<mark>$1</mark>');
+            } catch (e) {
+                return safeText;
+            }
+        }
+
+        function renderSearchResults(results, query) {
+            const box = document.getElementById('searchResults');
+            if (results.length === 0) {
+                box.innerHTML = '<div class="search-empty">找不到符合的記事</div>';
+                return;
+            }
+
+            box.innerHTML = '';
+            results.forEach(r => {
+                const item = r.item;
+                const div = document.createElement('div');
+                div.className = 'search-result-item';
+
+                const dateEl = document.createElement('div');
+                dateEl.className = 'search-result-date';
+                dateEl.textContent = '📅 ' + item.dateKey;
+
+                const textEl = document.createElement('div');
+                textEl.className = 'search-result-text';
+                textEl.innerHTML = highlightQueryInText(item.text, query);
+
+                div.appendChild(dateEl);
+                div.appendChild(textEl);
+                div.onclick = () => goToSearchResult(item.dateKey, item.noteIndex);
+                box.appendChild(div);
+            });
+        }
+
+        async function goToSearchResult(dateKey, noteIndex) {
+            hideSearchResults();
+            const [y, m, d] = dateKey.split('-').map(Number);
+            viewDate = new Date(y, m - 1, 1);
+            selectedDateKey = dateKey;
+            pendingHighlightNoteIndex = noteIndex;
+
+            await renderCalendar();
+            await renderNotes();
+
+            const list = document.getElementById('notesList');
+            const target = list ? list.querySelector(`[data-note-index="${pendingHighlightNoteIndex}"]`) : null;
+            if (target) {
+                target.classList.add('highlight');
+                target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                setTimeout(() => target.classList.remove('highlight'), 2500);
+            }
+            pendingHighlightNoteIndex = null;
+        }
+
+        // 點擊搜尋框以外的地方，收合搜尋結果
+        document.addEventListener('click', (e) => {
+            const wrap = document.querySelector('.search-wrap');
+            if (wrap && !wrap.contains(e.target)) {
+                hideSearchResults();
+            }
+        });
 
         // 初始化（一定會執行，就算 supabase 連線失敗，月曆本身也會顯示）
         renderCalendar();
