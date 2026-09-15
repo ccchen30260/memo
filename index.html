@@ -516,10 +516,14 @@
         // ⚠️ 請到 Google Cloud Console 建立 OAuth 用戶端 ID，並填在這裡
         const GOOGLE_CLIENT_ID = '952054817768-q4tnhfp0nm0jc0p02jkc2mnt0s6qlohc.apps.googleusercontent.com';
         const GOOGLE_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+        const GCAL_SESSION_KEY = 'gcal_token_cache_v1';   // 存在 sessionStorage：同分頁重整可沿用
+        const GCAL_EVER_CONNECTED_KEY = 'gcal_ever_connected_v1'; // 存在 localStorage：記得「之前連過」，開新分頁時嘗試靜默登入
 
         let googleTokenClient = null;
         let googleAccessToken = null;
+        let googleTokenExpiresAt = 0; // ms epoch
         let googleEventsCache = {};   // { 'YYYY-MM-DD': [event, ...] }
+        let gcalSilentAttempted = false;
 
         function setGcalState(msg, connected) {
             const el = document.getElementById('gcalState');
@@ -529,6 +533,39 @@
                 el.classList.toggle('connected', !!connected);
             }
             if (btn) btn.textContent = connected ? '中斷連結' : '連結 Google 日曆';
+        }
+
+        function saveGoogleTokenToSession(accessToken, expiresInSeconds) {
+            googleTokenExpiresAt = Date.now() + (Number(expiresInSeconds) || 3600) * 1000;
+            try {
+                sessionStorage.setItem(GCAL_SESSION_KEY, JSON.stringify({
+                    token: accessToken,
+                    expiresAt: googleTokenExpiresAt
+                }));
+                localStorage.setItem(GCAL_EVER_CONNECTED_KEY, '1');
+            } catch (e) { /* storage 不可用就略過，不影響功能 */ }
+        }
+
+        function clearGoogleTokenStorage() {
+            try {
+                sessionStorage.removeItem(GCAL_SESSION_KEY);
+            } catch (e) { /* 忽略 */ }
+        }
+
+        // 分頁重新整理時，先看看 sessionStorage 有沒有還沒過期的 token
+        function loadCachedGoogleToken() {
+            try {
+                const raw = sessionStorage.getItem(GCAL_SESSION_KEY);
+                if (!raw) return false;
+                const cache = JSON.parse(raw);
+                // 保留 2 分鐘緩衝，避免臨界點還沒用就過期
+                if (cache && cache.token && cache.expiresAt && cache.expiresAt - 120000 > Date.now()) {
+                    googleAccessToken = cache.token;
+                    googleTokenExpiresAt = cache.expiresAt;
+                    return true;
+                }
+            } catch (e) { /* 忽略壞掉的快取 */ }
+            return false;
         }
 
         function initGoogleTokenClient() {
@@ -541,11 +578,17 @@
                 scope: GOOGLE_SCOPE,
                 callback: async (resp) => {
                     if (resp.error) {
-                        showDebug('Google 授權失敗: ' + resp.error);
-                        setGcalState('授權失敗：' + resp.error, false);
+                        // 靜默嘗試失敗是正常情況（例如很久沒登入），不用跳警告，改回顯示按鈕即可
+                        if (resp.error === 'interaction_required' || resp.error === 'access_denied') {
+                            setGcalState('尚未連結 Google 日曆', false);
+                        } else {
+                            showDebug('Google 授權失敗: ' + resp.error);
+                            setGcalState('授權失敗：' + resp.error, false);
+                        }
                         return;
                     }
                     googleAccessToken = resp.access_token;
+                    saveGoogleTokenToSession(resp.access_token, resp.expires_in);
                     setGcalState('已連結 Google 日曆 ✓', true);
                     googleEventsCache = {};
                     await renderCalendar();
@@ -563,6 +606,8 @@
                 } catch (e) { /* 忽略 */ }
                 googleAccessToken = null;
                 googleEventsCache = {};
+                clearGoogleTokenStorage();
+                try { localStorage.removeItem(GCAL_EVER_CONNECTED_KEY); } catch (e) {}
                 setGcalState('尚未連結 Google 日曆', false);
                 renderCalendar();
                 renderNotes();
@@ -580,9 +625,40 @@
             googleTokenClient.requestAccessToken();
         }
 
+        // 頁面剛載入時嘗試自動恢復連線：
+        // 1) 先看同分頁的 sessionStorage 快取（重新整理最常見）
+        // 2) 沒有的話，如果之前連過，就用「靜默模式」試著在背景重新取得 token（不會跳視窗）
+        async function tryRestoreGoogleConnection() {
+            if (loadCachedGoogleToken()) {
+                setGcalState('已連結 Google 日曆 ✓', true);
+                await renderCalendar();
+                await renderNotes();
+                return;
+            }
+
+            let everConnected = false;
+            try { everConnected = localStorage.getItem(GCAL_EVER_CONNECTED_KEY) === '1'; } catch (e) {}
+            if (!everConnected || gcalSilentAttempted) return;
+            if (GOOGLE_CLIENT_ID.indexOf('請填入') === 0) return;
+
+            gcalSilentAttempted = true;
+
+            // 等 Google Identity Services 載入完成（最多等 5 秒）
+            for (let i = 0; i < 25; i++) {
+                if (typeof google !== 'undefined' && google.accounts && google.accounts.oauth2) break;
+                await new Promise(r => setTimeout(r, 200));
+            }
+            if (!initGoogleTokenClient()) return;
+
+            try {
+                googleTokenClient.requestAccessToken({ prompt: '' }); // 靜默模式，成功/失敗都會進入上面的 callback
+            } catch (e) { /* 靜默失敗就算了，使用者可以手動按按鈕 */ }
+        }
+
         // 授權過期時重新請求
         function handleGoogleAuthExpired() {
             googleAccessToken = null;
+            clearGoogleTokenStorage();
             setGcalState('授權已過期，請重新連結', false);
         }
 
@@ -838,8 +914,18 @@
         });
 
         // 初始化（一定會執行，就算 supabase 連線失敗，月曆本身也會顯示）
-        renderCalendar();
-        renderNotes();
+        (async function initPage() {
+            // 有快取就先套用，避免第一次畫面沒有 Google 標記又閃一次
+            if (loadCachedGoogleToken()) {
+                setGcalState('已連結 Google 日曆 ✓', true);
+            }
+            await renderCalendar();
+            await renderNotes();
+            // 沒有可用快取時，嘗試背景靜默重新連線（不會跳視窗打擾使用者）
+            if (!googleAccessToken) {
+                tryRestoreGoogleConnection();
+            }
+        })();
     </script>
 </body>
 </html>
